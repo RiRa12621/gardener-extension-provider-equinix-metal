@@ -14,10 +14,14 @@ import (
 	genericworkeractuator "github.com/gardener/gardener/extensions/pkg/controller/worker/genericactuator"
 	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	"github.com/gardener/gardener/pkg/client/kubernetes"
+	machinev1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
+	"k8s.io/utils/ptr"
 
 	"github.com/gardener/gardener-extension-provider-equinix-metal/charts"
 	api "github.com/gardener/gardener-extension-provider-equinix-metal/pkg/apis/equinixmetal"
 	"github.com/gardener/gardener-extension-provider-equinix-metal/pkg/equinixmetal"
+	gardencorev1beta1helper "github.com/gardener/gardener/pkg/apis/core/v1beta1/helper"
+	extensionsv1alpha1helper "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1/helper"
 )
 
 // DeployMachineClasses generates and creates the Equinix Metal specific machine classes.
@@ -64,6 +68,7 @@ func (w *workerDelegate) generateMachineConfig(ctx context.Context) error {
 	}
 
 	for _, pool := range w.worker.Spec.Pools {
+		zoneLen := int32(len(pool.Zones)) // #nosec: G115 - We check if pool zones exceeds max_int32.
 		workerConfig := &api.WorkerConfig{}
 		if pool.ProviderConfig != nil && pool.ProviderConfig.Raw != nil {
 			if _, _, err := w.decoder.Decode(pool.ProviderConfig.Raw, nil, workerConfig); err != nil {
@@ -92,62 +97,97 @@ func (w *workerDelegate) generateMachineConfig(ctx context.Context) error {
 			return err
 		}
 
-		machineClassSpec := map[string]interface{}{
-			"OS":            machineImage.ID,
-			"ipxeScriptUrl": machineImage.IPXEScriptURL,
-			"projectID":     string(credentials.ProjectID),
-			"billingCycle":  "hourly",
-			"machineType":   pool.MachineType,
-			"metro":         w.worker.Spec.Region,
-			"sshKeys":       []string{infrastructureStatus.SSHKeyID},
-			"tags": []string{
-				fmt.Sprintf("kubernetes.io/cluster/%s", w.worker.Namespace),
-				"kubernetes.io/role/node",
-			},
-			"secret": map[string]interface{}{
-				"cloudConfig": string(userData),
-			},
-			"credentialsSecretRef": map[string]interface{}{
-				"name":      w.worker.Spec.SecretRef.Name,
-				"namespace": w.worker.Spec.SecretRef.Namespace,
-			},
+		for zoneIndex, zone := range pool.Zones {
+			zoneIdx := int32(zoneIndex) // #nosec: G115 - We check if pool zones exceeds max_int32.
+
+			machineClassSpec := map[string]interface{}{
+				"OS":            machineImage.ID,
+				"ipxeScriptUrl": machineImage.IPXEScriptURL,
+				"zone":          zone,
+				"projectID":     string(credentials.ProjectID),
+				"billingCycle":  "hourly",
+				"machineType":   pool.MachineType,
+				"metro":         w.worker.Spec.Region,
+				"sshKeys":       []string{infrastructureStatus.SSHKeyID},
+				"tags": []string{
+					fmt.Sprintf("kubernetes.io/cluster/%s", w.worker.Namespace),
+					"kubernetes.io/role/node",
+				},
+				"secret": map[string]interface{}{
+					"cloudConfig": string(userData),
+				},
+				"credentialsSecretRef": map[string]interface{}{
+					"name":      w.worker.Spec.SecretRef.Name,
+					"namespace": w.worker.Spec.SecretRef.Namespace,
+				},
+			}
+
+			if len(pool.Zones) > 0 {
+				machineClassSpec["facilities"] = pool.Zones
+			}
+
+			if len(workerConfig.ReservationIDs) > 0 {
+				machineClassSpec["reservationIDs"] = workerConfig.ReservationIDs
+			}
+
+			if workerConfig.ReservedDevicesOnly != nil {
+				machineClassSpec["reservedDevicesOnly"] = *workerConfig.ReservedDevicesOnly
+			}
+
+			var (
+				deploymentName = fmt.Sprintf("%s-%s", w.worker.Namespace, pool.Name)
+				className      = fmt.Sprintf("%s-%s", deploymentName, workerPoolHash)
+			)
+
+			updateConfiguration := machinev1alpha1.UpdateConfiguration{
+				MaxUnavailable: ptr.To(worker.DistributePositiveIntOrPercent(zoneIdx, pool.MaxUnavailable, zoneLen, pool.Minimum)),
+				MaxSurge:       ptr.To(worker.DistributePositiveIntOrPercent(zoneIdx, pool.MaxSurge, zoneLen, pool.Maximum)),
+			}
+
+			machineDeploymentStrategy := machinev1alpha1.MachineDeploymentStrategy{
+				Type: machinev1alpha1.RollingUpdateMachineDeploymentStrategyType,
+				RollingUpdate: &machinev1alpha1.RollingUpdateMachineDeployment{
+					UpdateConfiguration: updateConfiguration,
+				},
+			}
+
+			if gardencorev1beta1helper.IsUpdateStrategyInPlace(pool.UpdateStrategy) {
+				machineDeploymentStrategy = machinev1alpha1.MachineDeploymentStrategy{
+					Type: machinev1alpha1.InPlaceUpdateMachineDeploymentStrategyType,
+					InPlaceUpdate: &machinev1alpha1.InPlaceUpdateMachineDeployment{
+						UpdateConfiguration: updateConfiguration,
+						OrchestrationType:   machinev1alpha1.OrchestrationTypeAuto,
+					},
+				}
+
+				if gardencorev1beta1helper.IsUpdateStrategyManualInPlace(pool.UpdateStrategy) {
+					machineDeploymentStrategy.InPlaceUpdate.OrchestrationType = machinev1alpha1.OrchestrationTypeManual
+				}
+			}
+
+			machineDeployments = append(machineDeployments, worker.MachineDeployment{
+				Name:                         deploymentName,
+				ClassName:                    className,
+				SecretName:                   className,
+				Minimum:                      pool.Minimum,
+				Maximum:                      pool.Maximum,
+				Strategy:                     machineDeploymentStrategy,
+				Priority:                     pool.Priority,
+				Labels:                       pool.Labels,
+				Annotations:                  pool.Annotations,
+				Taints:                       pool.Taints,
+				MachineConfiguration:         genericworkeractuator.ReadMachineConfiguration(pool),
+				ClusterAutoscalerAnnotations: extensionsv1alpha1helper.GetMachineDeploymentClusterAutoscalerAnnotations(pool.ClusterAutoscaler),
+			})
+
+			machineClassSpec["name"] = className
+			machineClassSpec["secret"].(map[string]interface{})["labels"] = map[string]string{v1beta1constants.GardenerPurpose: v1beta1constants.GardenPurposeMachineClass}
+			machineClassSpec["labels"] = map[string]string{
+				v1beta1constants.GardenerPurpose: v1beta1constants.GardenPurposeMachineClass,
+			}
+
+			machineClasses = append(machineClasses, machineClassSpec)
 		}
-
-		if len(pool.Zones) > 0 {
-			machineClassSpec["facilities"] = pool.Zones
-		}
-
-		if len(workerConfig.ReservationIDs) > 0 {
-			machineClassSpec["reservationIDs"] = workerConfig.ReservationIDs
-		}
-
-		if workerConfig.ReservedDevicesOnly != nil {
-			machineClassSpec["reservedDevicesOnly"] = *workerConfig.ReservedDevicesOnly
-		}
-
-		var (
-			deploymentName = fmt.Sprintf("%s-%s", w.worker.Namespace, pool.Name)
-			className      = fmt.Sprintf("%s-%s", deploymentName, workerPoolHash)
-		)
-
-		machineDeployments = append(machineDeployments, worker.MachineDeployment{
-			Name:                 deploymentName,
-			ClassName:            className,
-			SecretName:           className,
-			Minimum:              pool.Minimum,
-			Maximum:              pool.Maximum,
-			Labels:               pool.Labels,
-			Annotations:          pool.Annotations,
-			Taints:               pool.Taints,
-			MachineConfiguration: genericworkeractuator.ReadMachineConfiguration(pool),
-		})
-
-		machineClassSpec["name"] = className
-		machineClassSpec["labels"] = map[string]string{
-			v1beta1constants.GardenerPurpose: v1beta1constants.GardenPurposeMachineClass,
-		}
-
-		machineClasses = append(machineClasses, machineClassSpec)
 	}
 
 	w.machineDeployments = machineDeployments
